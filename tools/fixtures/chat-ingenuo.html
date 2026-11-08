@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Banco de prueba · chat ingenuo</title>
+<!--
+  BANCO DE PRUEBA SINTÉTICO. NO es el chat de LECO.
+  Reproduce a propósito los antipatrones más comunes de un chat con streaming
+  para validar que el arnés de medición (tools/browser-baseline.mjs) los detecta:
+   1. Indicador "..." animado con setInterval (JS en hilo principal → se congela).
+   2. Cada token re-renderiza TODA la conversación con innerHTML + markdown completo.
+   3. scroll forzado al final en cada token, aunque el usuario haya subido.
+   4. Caja de entrada en el flujo normal debajo del texto (se desplaza → CLS).
+-->
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 760px; padding: 16px; background: #fff; color: #111; }
+  .msg { padding: 10px 12px; margin: 8px 0; border-radius: 10px; }
+  .usuario { background: #eef2ff; }
+  .asistente { background: #f6f6f6; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: 2px 6px; }
+  pre { background: #222; color: #eee; padding: 8px; overflow: auto; }
+  #barra { display: flex; gap: 8px; margin-top: 12px; }
+  #entrada { flex: 1; padding: 8px; }
+</style>
+</head>
+<body>
+<div id="conversacion"></div>
+<div id="barra">
+  <input id="entrada" placeholder="Escribe…" value="¿Cómo va el avance de obra?">
+  <button id="enviar">Enviar</button>
+</div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const MODE = params.get('mode') || 'fluido';
+  const conv = document.getElementById('conversacion');
+  const mensajes = [];
+  for (let i = 0; i < 30; i++) {
+    mensajes.push({ rol: i % 2 ? 'asistente' : 'usuario', texto: i % 2 ? '**Respuesta previa** con una lista:\n- punto uno\n- punto dos\n\n| a | b |\n|---|---|\n| 1 | 2 |' : 'Pregunta previa número ' + i });
+  }
+
+  // Markdown "ingenuo": re-parsea el texto completo en cada llamada.
+  function md(t) {
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    let html = '';
+    const bloques = esc(t).split(/```/);
+    bloques.forEach((b, i) => {
+      if (i % 2) { html += '<pre><code>' + b + '</code></pre>'; return; }
+      const lineas = b.split('\n');
+      let tabla = [];
+      const flushTabla = () => {
+        if (!tabla.length) return;
+        html += '<table>' + tabla.filter((l) => !/^\|[-| ]+\|$/.test(l)).map((l) => '<tr>' + l.split('|').slice(1, -1).map((c) => '<td>' + c + '</td>').join('') + '</tr>').join('') + '</table>';
+        tabla = [];
+      };
+      for (const l of lineas) {
+        if (l.startsWith('|')) { tabla.push(l); continue; }
+        flushTabla();
+        if (l.startsWith('## ')) html += '<h2>' + l.slice(3) + '</h2>';
+        else if (l.startsWith('- ')) html += '<li>' + l.slice(2) + '</li>';
+        else if (l.trim()) html += '<p>' + l.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>') + '</p>';
+      }
+      flushTabla();
+    });
+    return html;
+  }
+
+  function renderTodo() {
+    conv.innerHTML = mensajes.map((m) =>
+      '<div class="msg ' + m.rol + '" ' + (m.rol === 'asistente' ? 'data-role="assistant"' : '') + '>' +
+      (m.pensando ? '<span id="puntos">.</span>' : md(m.texto)) + '</div>').join('');
+    window.scrollTo(0, document.body.scrollHeight); // forzado, siempre
+  }
+  renderTodo();
+
+  let timerPuntos = null;
+  async function enviar() {
+    const entrada = document.getElementById('entrada');
+    mensajes.push({ rol: 'usuario', texto: entrada.value });
+    const actual = { rol: 'asistente', texto: '', pensando: true };
+    mensajes.push(actual);
+    renderTodo();
+    let n = 1;
+    timerPuntos = setInterval(() => { const p = document.getElementById('puntos'); if (p) p.textContent = '.'.repeat(1 + (n++ % 3)); }, 300);
+
+    const resp = await fetch('/sse?mode=' + encodeURIComponent(MODE), { method: 'POST', body: '{}' });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!ev.startsWith('data:')) continue;
+        const data = ev.slice(5).trim();
+        if (data === '[DONE]') continue;
+        actual.pensando = false;
+        clearInterval(timerPuntos);
+        actual.texto += JSON.parse(data).delta;
+        renderTodo(); // antipatrón: todo el árbol, en cada token
+      }
+    }
+    clearInterval(timerPuntos);
+    actual.pensando = false;
+    renderTodo();
+  }
+  document.getElementById('enviar').addEventListener('click', enviar);
+</script>
+</body>
+</html>
